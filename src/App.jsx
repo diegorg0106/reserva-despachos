@@ -33,18 +33,24 @@ import {
   ChevronLeft,
   ChevronRight
 } from "lucide-react";
+import { supabase } from "./supabase";
 
 /* ========= Config ========= */
 const TZ = "Europe/Madrid";
 const SLOT_MINUTES = 30;
-const STORAGE_KEY = "officeBookingsV1";
-const STORAGE_SETTINGS = "officeSettingsV1";
 // Altura visual por franja (mejor legibilidad y botones dentro)
-const ROW_PX = 64;             // píxeles por franja de 30 min
-const SLOT_ROW_CLASS = "h-16"; // tailwind 64px
+const ROW_PX = 72;             // píxeles por franja de 30 min
+const SLOT_ROW_CLASS = "h-16"; // tailwind aprox 64px para las filas (la tarjeta usa ROW_PX)
 
 /* ========= Utils ========= */
 const timeToLabel = (date) => format(date, "HH:mm", { locale: es });
+
+// Rango [start, end) del día en ISO (UTC) para filtrar en Supabase sin líos de TZ
+function dayRangeISO(day) {
+  const start = startOfDay(day);
+  const end = addDays(start, 1);
+  return { startISO: start.toISOString(), endISO: end.toISOString() };
+}
 
 function enumerateSlots(day, startHour, endHour) {
   const slots = [];
@@ -65,28 +71,6 @@ function toISOLocal(d) {
 function fromISO(d) {
   return parseISO(d);
 }
-function loadBookings() {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    return raw ? JSON.parse(raw) : [];
-  } catch {
-    return [];
-  }
-}
-function saveBookings(list) {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(list));
-}
-function loadSettings() {
-  try {
-    const raw = localStorage.getItem(STORAGE_SETTINGS);
-    return raw ? JSON.parse(raw) : null;
-  } catch {
-    return null;
-  }
-}
-function saveSettings(s) {
-  localStorage.setItem(STORAGE_SETTINGS, JSON.stringify(s));
-}
 
 /* helpers para <input type="date"> */
 const toDateInput = (d) => format(d, "yyyy-MM-dd");
@@ -96,40 +80,89 @@ const fromDateInput = (v) => {
   return startOfDay(dt);
 };
 
+/* ========= API Supabase ========= */
+async function fetchBookingsForDay(day) {
+  const { startISO, endISO } = dayRangeISO(day);
+  const { data, error } = await supabase
+    .from("bookings")
+    .select("*")
+    .gte("start", startISO)
+    .lt("start", endISO)
+    .order("start", { ascending: true });
+
+  if (error) {
+    console.error(error);
+    toast.error("No pude cargar reservas");
+    return [];
+  }
+  return data || [];
+}
+
+async function upsertBooking(b) {
+  const payload = {
+    id: b.id,
+    room: b.room,
+    person: b.person,
+    purpose: b.purpose,
+    start: new Date(b.start).toISOString(),
+    end: new Date(b.end).toISOString(),
+    created_at: new Date(b.createdAt || Date.now()).toISOString(),
+  };
+  const { error } = await supabase.from("bookings").upsert(payload);
+  if (error) throw error;
+}
+
+async function deleteBookingDb(id) {
+  const { error } = await supabase.from("bookings").delete().eq("id", id);
+  if (error) throw error;
+}
+
 /* ========= App ========= */
 export default function App() {
   const today = useMemo(() => new Date(), []);
   const [currentDay, setCurrentDay] = useState(startOfDay(today));
-  const [bookings, setBookings] = useState(loadBookings());
-  const [settings, setSettings] = useState(
-    loadSettings() || {
-      rooms: ["Despacho 1", "Despacho 2", "Despacho 3", "Despacho 4"],
-      startHour: 8,
-      endHour: 22,
-      requireName: true,
-      allowPast: false
-    }
-  );
+  const [bookings, setBookings] = useState([]);
+  const [settings, setSettings] = useState({
+    rooms: ["Despacho 1", "Despacho 2", "Despacho 3", "Despacho 4"],
+    startHour: 8,
+    endHour: 22,
+    requireName: true,
+    allowPast: false
+  });
   const [openSettings, setOpenSettings] = useState(false);
 
-  useEffect(() => saveBookings(bookings), [bookings]);
-  useEffect(() => saveSettings(settings), [settings]);
+  // Carga del día seleccionado
+  useEffect(() => {
+    (async () => {
+      const list = await fetchBookingsForDay(currentDay);
+      setBookings(list);
+    })();
+  }, [currentDay]);
+
+  // Realtime: si hay cambios en la tabla, refresco el día actual
+  useEffect(() => {
+    const channel = supabase
+      .channel("bookings-realtime")
+      .on(
+        "postgres_changes",
+        { event: "*", schema: "public", table: "bookings" },
+        async () => {
+          const list = await fetchBookingsForDay(currentDay);
+          setBookings(list);
+        }
+      )
+      .subscribe();
+    return () => { supabase.removeChannel(channel); };
+  }, [currentDay]);
 
   const slots = useMemo(
     () => enumerateSlots(currentDay, settings.startHour, settings.endHour),
     [currentDay, settings.startHour, settings.endHour]
   );
-  const dayBookings = useMemo(
-    () =>
-      bookings.filter(
-        (b) =>
-          format(fromISO(b.start), "yyyy-MM-dd") ===
-          format(currentDay, "yyyy-MM-dd")
-      ),
-    [bookings, currentDay]
-  );
 
-  function addOrUpdateBooking(newB) {
+  const dayBookings = bookings; // ya viene filtrado por día desde la BD
+
+  async function addOrUpdateBooking(newB) {
     if (settings.requireName && !newB.person?.trim()) {
       toast.error("Añade un nombre o equipo");
       return false;
@@ -140,7 +173,9 @@ export default function App() {
       toast.error("No se permiten reservas en el pasado");
       return false;
     }
-    const conflict = bookings.some(
+
+    // Comprobación rápida de solapes en el cliente (evita conflictos visuales)
+    const conflict = dayBookings.some(
       (b) =>
         b.id !== newB.id &&
         b.room === newB.room &&
@@ -150,22 +185,34 @@ export default function App() {
       toast.error("El despacho ya está reservado en ese horario");
       return false;
     }
-    setBookings((prev) => {
-      const exists = prev.some((b) => b.id === newB.id);
-      return exists ? prev.map((b) => (b.id === newB.id ? newB : b)) : [...prev, newB];
-    });
-    toast.success("Reserva guardada");
-    return true;
-  }
-  function deleteBooking(id) {
-    setBookings((prev) => prev.filter((b) => b.id !== id));
-    toast("Reserva eliminada");
-  }
-  function clearAll() {
-    if (confirm("¿Seguro que quieres borrar TODAS las reservas?")) {
-      setBookings([]);
-      toast("Todo borrado");
+
+    try {
+      await upsertBooking(newB);
+      toast.success("Reserva guardada");
+      const list = await fetchBookingsForDay(currentDay);
+      setBookings(list);
+      return true;
+    } catch (err) {
+      console.error(err);
+      toast.error("No se pudo guardar la reserva");
+      return false;
     }
+  }
+
+  async function deleteBooking(id) {
+    try {
+      await deleteBookingDb(id);
+      toast("Reserva eliminada");
+      const list = await fetchBookingsForDay(currentDay);
+      setBookings(list);
+    } catch (err) {
+      console.error(err);
+      toast.error("No se pudo eliminar");
+    }
+  }
+
+  function clearAll() {
+    toast("Para vaciar todo, mejor hacerlo desde la base de datos.");
   }
 
   return (
@@ -177,7 +224,7 @@ export default function App() {
         <div className="flex items-center justify-between gap-3">
           <div>
             <h1 className="text-2xl font-bold">Reserva de Despachos</h1>
-            <p className="text-slate-600">Gestión por horas · Zona horaria: {TZ}</p>
+            <p className="text-slate-600">Compartido · en tiempo real · Zona horaria: {TZ}</p>
           </div>
           <div className="flex items-center gap-2">
             <button
@@ -299,7 +346,7 @@ export default function App() {
       )}
 
       <footer className="max-w-6xl mx-auto mt-6 text-center text-xs text-slate-500">
-        Hecho con ❤️ · v1.2 · Selector de fecha, semana y mini calendario; tarjetas ajustadas
+        Hecho con ❤️ · v2 · Supabase en tiempo real
       </footer>
     </div>
   );
@@ -326,9 +373,7 @@ function WeekStrip({ currentDay, onSelect }) {
           <button
             key={d.toISOString()}
             onClick={() => onSelect(startOfDay(d))}
-            className={`px-3 py-2 rounded-xl text-sm border ${
-              isActive ? "bg-slate-900 text-white" : "bg-white hover:bg-slate-50"
-            }`}
+            className={`px-3 py-2 rounded-xl text-sm border ${isActive ? "bg-slate-900 text-white" : "bg-white hover:bg-slate-50"}`}
             title={format(d, "EEEE d 'de' MMMM", { locale: es })}
           >
             <div className="text-[11px]">{format(d, "EEE", { locale: es })}</div>
@@ -351,9 +396,7 @@ function WeekStrip({ currentDay, onSelect }) {
 function MiniCalendar({ selected, onSelect }) {
   const [viewMonth, setViewMonth] = useState(startOfMonth(selected));
 
-  useEffect(() => {
-    setViewMonth(startOfMonth(selected));
-  }, [selected]);
+  useEffect(() => { setViewMonth(startOfMonth(selected)); }, [selected]);
 
   const start = startOfWeek(startOfMonth(viewMonth), { weekStartsOn: 1 });
   const end = endOfWeek(endOfMonth(viewMonth), { weekStartsOn: 1 });
@@ -366,25 +409,17 @@ function MiniCalendar({ selected, onSelect }) {
   return (
     <div className="bg-white border rounded-2xl shadow-sm">
       <div className="p-3 border-b flex items-center justify-between">
-        <button
-          className="p-2 rounded-lg border hover:bg-slate-50"
-          onClick={() => setViewMonth(subMonths(viewMonth, 1))}
-        >
+        <button className="p-2 rounded-lg border hover:bg-slate-50" onClick={() => setViewMonth(subMonths(viewMonth, 1))}>
           <ChevronLeft className="w-4 h-4" />
         </button>
         <div className="font-semibold">{format(viewMonth, "MMMM yyyy", { locale: es })}</div>
-        <button
-          className="p-2 rounded-lg border hover:bg-slate-50"
-          onClick={() => setViewMonth(addMonths(viewMonth, 1))}
-        >
+        <button className="p-2 rounded-lg border hover:bg-slate-50" onClick={() => setViewMonth(addMonths(viewMonth, 1))}>
           <ChevronRight className="w-4 h-4" />
         </button>
       </div>
 
       <div className="px-3 py-2 grid grid-cols-7 gap-1 text-center text-xs text-slate-500">
-        {["L", "M", "X", "J", "V", "S", "D"].map((d) => (
-          <div key={d} className="py-1">{d}</div>
-        ))}
+        {["L","M","X","J","V","S","D"].map((d) => <div key={d} className="py-1">{d}</div>)}
       </div>
 
       <div className="px-2 pb-3 grid grid-cols-7 gap-1">
@@ -396,11 +431,9 @@ function MiniCalendar({ selected, onSelect }) {
               key={d.toISOString()}
               onClick={() => onSelect(startOfDay(d))}
               className={`py-2 rounded-xl text-sm border ${
-                active
-                  ? "bg-slate-900 text-white border-slate-900"
-                  : isCurrentMonth
-                  ? "bg-white hover:bg-slate-50"
-                  : "bg-slate-50 text-slate-400"
+                active ? "bg-slate-900 text-white border-slate-900"
+                       : isCurrentMonth ? "bg-white hover:bg-slate-50"
+                                        : "bg-slate-50 text-slate-400"
               }`}
               title={format(d, "EEEE d 'de' MMMM", { locale: es })}
             >
@@ -448,7 +481,7 @@ function BookingForm({ currentDay, settings, onSubmit }) {
     return arr;
   }, [settings.startHour, settings.endHour]);
 
-  function handleSubmit(e) {
+  async function handleSubmit(e) {
     e.preventDefault();
     const [hh, mm] = startTime.split(":").map(Number);
     let start = setHours(setMinutes(startOfDay(currentDay), mm), hh);
@@ -464,7 +497,7 @@ function BookingForm({ currentDay, settings, onSubmit }) {
       createdAt: toISOLocal(new Date())
     };
 
-    const ok = onSubmit(booking);
+    const ok = await onSubmit(booking);
     if (ok) {
       setId(null);
       setPurpose("");
@@ -479,7 +512,7 @@ function BookingForm({ currentDay, settings, onSubmit }) {
     const roomName = settings.rooms[room] || `Despacho ${room + 1}`;
     const title = `Reserva ${roomName}${person ? ` · ${person}` : ""}`;
     const description = purpose || "Reserva de despacho";
-    const ics = generateICS({ title, description, location: roomName, start, end, timezone: TZ });
+    const ics = generateICS({ title, description, location: roomName, start, end });
     const blob = new Blob([ics], { type: "text/calendar;charset=utf-8" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
@@ -537,7 +570,10 @@ function BookingForm({ currentDay, settings, onSubmit }) {
 function DayGrid({ day, slots, rooms, bookings, onEdit, onDelete }) {
   return (
     <div className="overflow-x-auto">
-      <div className="min-w-[720px] grid" style={{ gridTemplateColumns: `120px repeat(${rooms.length}, minmax(0, 1fr))` }}>
+      <div
+        className="min-w-[900px] grid"
+        style={{ gridTemplateColumns: `120px repeat(${rooms.length}, minmax(220px, 1fr))` }}
+      >
         {/* Cabeceras */}
         <div></div>
         {rooms.map((r, i) => (
@@ -563,33 +599,37 @@ function Cell({ time, roomIndex, bookings, onEdit, onDelete }) {
     (b) => b.room === roomIndex && fromISO(b.start) <= time && time < fromISO(b.end)
   );
 
+  // 1) Sin reserva
   if (!active) {
     return <div className={`border-b border-slate-100 ${SLOT_ROW_CLASS} hover:bg-slate-50 transition-colors`}></div>;
   }
 
   const isStart = isEqual(fromISO(active.start), time);
+
+  // 2) Continuación: sin bordes ni fondo (para que la tarjeta del inicio parezca ocupar todo)
   if (!isStart) {
-    return <div className={`border-b border-slate-100 ${SLOT_ROW_CLASS} bg-slate-100/40`}></div>;
+    return <div className={`${SLOT_ROW_CLASS}`}></div>;
   }
 
+  // 3) Inicio (tarjeta)
   const minutes = differenceInMinutes(fromISO(active.end), fromISO(active.start));
   const rows = Math.max(1, Math.ceil(minutes / SLOT_MINUTES));
 
   return (
-    <div className="border-b border-slate-100">
+    <div>
       <div
         className="m-1 p-2 rounded-2xl shadow-sm bg-white border border-slate-200 flex flex-col gap-1 overflow-hidden"
-        style={{ height: `${rows * ROW_PX - 8}px` }} // -8 por el margen m-1
+        style={{ height: `${rows * ROW_PX - 8}px` }}
       >
-        <div className="text-sm font-semibold text-slate-800 truncate">{active.person || "Reserva"}</div>
-        <div className="text-xs text-slate-600 line-clamp-2">{active.purpose || "—"}</div>
-        <div className="text-[11px] text-slate-500 mt-auto">
+        <div className="text-base font-semibold text-slate-900">{active.person || "Reserva"}</div>
+        <div className="text-sm text-slate-700 break-words">{active.purpose || "—"}</div>
+        <div className="text-[12px] text-slate-500 mt-auto">
           {timeToLabel(fromISO(active.start))}–{timeToLabel(fromISO(active.end))}
         </div>
         <div className="flex flex-wrap items-center gap-1 mt-1">
-          <button onClick={() => onEdit(active)} className="px-2 py-1 rounded-lg bg-slate-900 text-white text-[11px]">Editar</button>
-          <button onClick={() => onDelete(active.id)} className="px-2 py-1 rounded-lg border text-[11px]">Cancelar</button>
-          <button onClick={() => downloadICSForBooking(active)} className="px-2 py-1 rounded-lg border text-[11px]">ICS</button>
+          <button onClick={() => onEdit(active)} className="px-2 py-1 rounded-lg bg-slate-900 text-white text-[12px]">Editar</button>
+          <button onClick={() => onDelete(active.id)} className="px-2 py-1 rounded-lg border text-[12px]">Cancelar</button>
+          <button onClick={() => downloadICSForBooking(active)} className="px-2 py-1 rounded-lg border text-[12px]">ICS</button>
           <CopyButton booking={active} />
         </div>
       </div>
@@ -605,7 +645,7 @@ function CopyButton({ booking }) {
     navigator.clipboard.writeText(txt).then(() => toast("Copiado al portapapeles"));
   }
   return (
-    <button onClick={copy} className="px-2 py-1 rounded-lg text-[11px] border flex items-center gap-1">
+    <button onClick={copy} className="px-2 py-1 rounded-lg text-[12px] border flex items-center gap-1">
       <Copy className="h-3 w-3" /> Copiar
     </button>
   );
@@ -671,9 +711,7 @@ function SettingsPanel({ settings, setSettings, onClose }) {
 }
 
 /* ========= ICS ========= */
-function pad(n) {
-  return String(n).padStart(2, "0");
-}
+function pad(n) { return String(n).padStart(2, "0"); }
 function toICSDate(dt) {
   return (
     dt.getUTCFullYear() +
