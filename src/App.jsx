@@ -15,20 +15,33 @@ import {
   eachDayOfInterval,
   startOfMonth,
   endOfMonth,
-  getDay,
   subMonths,
   addMonths
 } from "date-fns";
 import { es } from "date-fns/locale";
 import { v4 as uuidv4 } from "uuid";
 import { Toaster, toast } from "sonner";
-import { Download, Clock, Calendar as CalendarIcon, Building2, Users, Settings2, X, Copy, ChevronLeft, ChevronRight } from "lucide-react";
+import {
+  Download,
+  Clock,
+  Calendar as CalendarIcon,
+  Building2,
+  Users,
+  Settings2,
+  X,
+  Copy,
+  ChevronLeft,
+  ChevronRight
+} from "lucide-react";
 
 /* ========= Config ========= */
 const TZ = "Europe/Madrid";
 const SLOT_MINUTES = 30;
 const STORAGE_KEY = "officeBookingsV1";
 const STORAGE_SETTINGS = "officeSettingsV1";
+// Altura visual por franja (mejor legibilidad y botones dentro)
+const ROW_PX = 64;             // píxeles por franja de 30 min
+const SLOT_ROW_CLASS = "h-16"; // tailwind 64px
 
 /* ========= Utils ========= */
 const timeToLabel = (date) => format(date, "HH:mm", { locale: es });
@@ -205,7 +218,7 @@ export default function App() {
             Mañana →
           </button>
 
-          {/* NUEVO: selector de fecha */}
+          {/* Selector de fecha */}
           <input
             type="date"
             className="ml-2 px-3 py-2 border rounded-lg text-sm bg-white"
@@ -218,14 +231,14 @@ export default function App() {
           </div>
         </div>
 
-        {/* NUEVO: tira de semana */}
+        {/* Tira de semana */}
         <WeekStrip currentDay={currentDay} onSelect={setCurrentDay} />
       </header>
 
       {/* Main */}
       <main className="max-w-6xl mx-auto grid grid-cols-1 lg:grid-cols-3 gap-4">
         <div className="lg:col-span-1 space-y-4">
-          {/* NUEVO: mini calendario mensual */}
+          {/* Mini calendario mensual */}
           <MiniCalendar selected={currentDay} onSelect={setCurrentDay} />
 
           {/* Formulario */}
@@ -286,7 +299,7 @@ export default function App() {
       )}
 
       <footer className="max-w-6xl mx-auto mt-6 text-center text-xs text-slate-500">
-        Hecho con ❤️ · v1.1 · Selector de fecha, semana y mini calendario
+        Hecho con ❤️ · v1.2 · Selector de fecha, semana y mini calendario; tarjetas ajustadas
       </footer>
     </div>
   );
@@ -339,7 +352,6 @@ function MiniCalendar({ selected, onSelect }) {
   const [viewMonth, setViewMonth] = useState(startOfMonth(selected));
 
   useEffect(() => {
-    // si cambias selected desde fuera (date input / week strip), sincroniza mes
     setViewMonth(startOfMonth(selected));
   }, [selected]);
 
@@ -535,7 +547,7 @@ function DayGrid({ day, slots, rooms, bookings, onEdit, onDelete }) {
         {/* Filas */}
         {slots.map((t, rowIdx) => (
           <React.Fragment key={rowIdx}>
-            <div className="px-2 py-3 text-xs text-slate-500 border-b border-slate-100 sticky left-0 bg-white z-10">{timeToLabel(t)}</div>
+            <div className={`px-2 py-3 text-xs text-slate-500 border-b border-slate-100 sticky left-0 bg-white z-10 ${SLOT_ROW_CLASS}`}>{timeToLabel(t)}</div>
             {rooms.map((_, colIdx) => (
               <Cell key={`${rowIdx}-${colIdx}`} time={t} roomIndex={colIdx} bookings={bookings} onEdit={onEdit} onDelete={onDelete} />
             ))}
@@ -552,12 +564,12 @@ function Cell({ time, roomIndex, bookings, onEdit, onDelete }) {
   );
 
   if (!active) {
-    return <div className="border-b border-slate-100 h-12 hover:bg-slate-50 transition-colors"></div>;
+    return <div className={`border-b border-slate-100 ${SLOT_ROW_CLASS} hover:bg-slate-50 transition-colors`}></div>;
   }
 
   const isStart = isEqual(fromISO(active.start), time);
   if (!isStart) {
-    return <div className="border-b border-slate-100 h-12 bg-slate-100/40"></div>;
+    return <div className={`border-b border-slate-100 ${SLOT_ROW_CLASS} bg-slate-100/40`}></div>;
   }
 
   const minutes = differenceInMinutes(fromISO(active.end), fromISO(active.start));
@@ -566,18 +578,18 @@ function Cell({ time, roomIndex, bookings, onEdit, onDelete }) {
   return (
     <div className="border-b border-slate-100">
       <div
-        className="m-1 p-2 rounded-2xl shadow-sm bg-white border border-slate-200 flex flex-col gap-1"
-        style={{ height: `${rows * 48 - 8}px` }}
+        className="m-1 p-2 rounded-2xl shadow-sm bg-white border border-slate-200 flex flex-col gap-1 overflow-hidden"
+        style={{ height: `${rows * ROW_PX - 8}px` }} // -8 por el margen m-1
       >
-        <div className="text-sm font-semibold line-clamp-1">{active.person || "Reserva"}</div>
+        <div className="text-sm font-semibold text-slate-800 truncate">{active.person || "Reserva"}</div>
         <div className="text-xs text-slate-600 line-clamp-2">{active.purpose || "—"}</div>
         <div className="text-[11px] text-slate-500 mt-auto">
           {timeToLabel(fromISO(active.start))}–{timeToLabel(fromISO(active.end))}
         </div>
-        <div className="flex items-center gap-2 mt-1">
-          <button onClick={() => onEdit(active)} className="px-2 py-1 rounded-lg bg-slate-900 text-white text-xs">Editar</button>
-          <button onClick={() => onDelete(active.id)} className="px-2 py-1 rounded-lg border text-xs">Cancelar</button>
-          <button onClick={() => downloadICSForBooking(active)} className="px-2 py-1 rounded-lg text-xs border">ICS</button>
+        <div className="flex flex-wrap items-center gap-1 mt-1">
+          <button onClick={() => onEdit(active)} className="px-2 py-1 rounded-lg bg-slate-900 text-white text-[11px]">Editar</button>
+          <button onClick={() => onDelete(active.id)} className="px-2 py-1 rounded-lg border text-[11px]">Cancelar</button>
+          <button onClick={() => downloadICSForBooking(active)} className="px-2 py-1 rounded-lg border text-[11px]">ICS</button>
           <CopyButton booking={active} />
         </div>
       </div>
@@ -593,7 +605,7 @@ function CopyButton({ booking }) {
     navigator.clipboard.writeText(txt).then(() => toast("Copiado al portapapeles"));
   }
   return (
-    <button onClick={copy} className="px-2 py-1 rounded-lg text-xs border flex items-center gap-1">
+    <button onClick={copy} className="px-2 py-1 rounded-lg text-[11px] border flex items-center gap-1">
       <Copy className="h-3 w-3" /> Copiar
     </button>
   );
